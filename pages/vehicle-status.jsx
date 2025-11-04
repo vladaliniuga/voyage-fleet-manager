@@ -2,15 +2,85 @@
 import { useEffect, useMemo, useState } from 'react';
 import DashboardLayout from '@/components/layout/DashboardLayout';
 import { db } from '@/lib/firebase';
-import { collection, onSnapshot, query, where } from 'firebase/firestore';
+import {
+  collection,
+  onSnapshot,
+  query,
+  where,
+  doc,
+  updateDoc,
+} from 'firebase/firestore';
+import { getAuth } from 'firebase/auth';
 import { FiSearch, FiX } from 'react-icons/fi';
 import Modal from '@/components/ui/Modal';
 import Button from '@/components/ui/Button';
-import ReservationCardCompact from '@/features/_shared/ReservationCardCompact';
 
 const AVAILABLE = 'DXuCBw5ovRqNwkda3e5i';
 const PARKED = 'wHdkyrnMeyEYfgUJgRek';
 const OFF_LOT = '58WZhssfhAVfxsvTiOFs';
+
+const now = Date.now();
+
+/** Firestore Timestamp/seconds/number -> ms */
+function tsToMillis(v) {
+  if (typeof v === 'number') return v;
+  if (v && typeof v.toMillis === 'function') return v.toMillis();
+  if (v && typeof v.seconds === 'number') return v.seconds * 1000;
+  return NaN;
+}
+
+/** Parse time in "HH:mm" or "h:mmam"/"h:mmpm" (case-insensitive) → "HH:mm" 24h */
+function parseTimeTo24h(timeStr) {
+  if (!timeStr || typeof timeStr !== 'string') return null;
+  const s = timeStr.trim().toLowerCase();
+
+  // 24h "HH:mm"
+  const m24 = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (m24) {
+    let [, hh, mm] = m24;
+    const H = Math.max(0, Math.min(23, parseInt(hh, 10)));
+    const M = Math.max(0, Math.min(59, parseInt(mm, 10)));
+    return `${String(H).padStart(2, '0')}:${String(M).padStart(2, '0')}`;
+  }
+
+  // 12h "h:mmam" / "h:mmpm" / with space (e.g. "1:07 pm", "9 am")
+  const m12 = s.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m?\.?$/i);
+  if (m12) {
+    let hour = parseInt(m12[1] || '0', 10);
+    let min = parseInt(m12[2] || '0', 10);
+    const ap = m12[3]; // 'a' or 'p'
+    hour = Math.max(1, Math.min(12, hour));
+    min = Math.max(0, Math.min(59, min));
+    if (ap === 'p' && hour !== 12) hour += 12;
+    if (ap === 'a' && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+  }
+
+  // simple "h am"/"h pm"
+  const m12simple = s.match(/^(\d{1,2})\s*([ap])\.?m?\.?$/i);
+  if (m12simple) {
+    let hour = parseInt(m12simple[1] || '0', 10);
+    const ap = m12simple[2];
+    hour = Math.max(1, Math.min(12, hour));
+    if (ap === 'p' && hour !== 12) hour += 12;
+    if (ap === 'a' && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, '0')}:00`;
+  }
+
+  // Unknown format
+  return null;
+}
+
+/** Build local timestamp (ms) from "yyyy-mm-dd" + flexible time */
+function toTimestamp(dateStr, timeStr) {
+  if (!dateStr) return null;
+  const hhmm = parseTimeTo24h(timeStr) ?? '23:59';
+  const ts = new Date(`${dateStr}T${hhmm}:00`).getTime();
+  return Number.isFinite(ts) ? ts : null;
+}
+
+// 👇 Replace with your real "Closed" reservationStatus id
+const CLOSED_STATUS_ID = 'W6TBsaDUeLB9R6POm9Hf';
 
 const locations = [
   { id: '5czwtumKOwNiRLtfVNDw', label: 'Airport' },
@@ -30,6 +100,50 @@ function getTodayDate() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// Respect the "show closed" toggle
+function filterEventsByClosed(allEvents = [], showClosed) {
+  if (showClosed) return allEvents;
+  return allEvents.filter(
+    (e) =>
+      String(e?.status || '').toLowerCase() === 'oos' ||
+      e?.status !== CLOSED_STATUS_ID
+  );
+}
+
+// Small pill for currentTrip status in Vehicle header
+function TripPill({ trip }) {
+  if (!trip?.status) return null;
+
+  const nowMs = now;
+  const isOOS = trip.status === 'out of service';
+  const lateAfterMs = tsToMillis(trip.lateAfter);
+  const isReservation = !isOOS;
+  const isLate =
+    isReservation && Number.isFinite(lateAfterMs) && nowMs >= lateAfterMs;
+
+  let bg = '#dbeafe',
+    fg = '#1e40af',
+    label = 'Rented'; // default
+  if (isOOS) {
+    bg = '#ef4444';
+    fg = '#ffffff';
+    label = 'Out of service';
+  } else if (isLate) {
+    bg = '#ef4444';
+    fg = '#ffffff';
+    label = 'Late';
+  }
+
+  return (
+    <span
+      className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ml-2"
+      style={{ background: bg, color: fg }}
+    >
+      {label}
+    </span>
+  );
+}
+
 /* ---------- Main ---------- */
 export default function VehicleStatus() {
   const [vehicles, setVehicles] = useState([]);
@@ -38,9 +152,13 @@ export default function VehicleStatus() {
   const [search, setSearch] = useState('');
   const [openVehicleModal, setOpenVehicleModal] = useState(false);
   const [selectedVehicle, setSelectedVehicle] = useState(null);
+  const [showClosedReservations, setShowClosedReservations] = useState(false);
 
   // Location filter
   const [selectedLocationId, setSelectedLocationId] = useState('all');
+
+  const auth = getAuth();
+  const currentUser = auth.currentUser || null;
 
   const today = getTodayDate();
 
@@ -51,7 +169,7 @@ export default function VehicleStatus() {
       qRef,
       (snap) => {
         const list = [];
-        snap.forEach((doc) => list.push({ id: doc.id, ...doc.data() }));
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() }));
         setVehicles(list);
       },
       (err) => console.error('vehicles onSnapshot error:', err)
@@ -70,7 +188,7 @@ export default function VehicleStatus() {
       qRef,
       (snap) => {
         const events = [];
-        snap.forEach((doc) => events.push({ id: doc.id, ...doc.data() }));
+        snap.forEach((d) => events.push({ id: d.id, ...d.data() }));
         setVehicleEvents(events);
       },
       (err) => console.error('vehicleEvents onSnapshot error:', err)
@@ -85,7 +203,7 @@ export default function VehicleStatus() {
       qRef,
       (snap) => {
         const list = [];
-        snap.forEach((doc) => list.push({ id: doc.id, ...doc.data() }));
+        snap.forEach((d) => list.push({ id: d.id, ...d.data() }));
         setReservationStatuses(list);
       },
       (err) => console.error('reservationStatus onSnapshot error:', err)
@@ -124,8 +242,7 @@ export default function VehicleStatus() {
         returnLocation: ev.returnLocation || '',
       }));
 
-      // Build a renterFallback string for searching:
-      // include each non-empty renterName once (case-insensitive)
+      // renterFallback (legacy); search uses filtered events below
       const renterFallback = Array.from(
         new Set(
           normalized
@@ -139,14 +256,20 @@ export default function VehicleStatus() {
     });
   }, [vehicles, vehicleEvents]);
 
-  // --- Search (applied before counts and location) ---
+  // --- Search (respects the "show closed" toggle) ---
   const searchFiltered = useMemo(() => {
     const s = search.trim().toLowerCase();
     const active = enrichedVehicles.filter((v) => !v.archived);
     if (!s) return active;
 
     return active.filter((v) => {
-      const eventText = (v.events || [])
+      // Only consider events after applying the closed filter
+      const eventsForSearch = filterEventsByClosed(
+        v.events,
+        showClosedReservations
+      );
+
+      const eventText = (eventsForSearch || [])
         .flatMap((e) => [
           e.renterName,
           e.description,
@@ -154,27 +277,61 @@ export default function VehicleStatus() {
           e.endDate,
           e.startTime,
           e.endTime,
-          e.status, // id or 'oos'
+          e.status,
         ])
         .filter(Boolean)
         .join(' ');
+
+      const renterNamesFiltered = Array.from(
+        new Set(
+          (eventsForSearch || [])
+            .map((e) => e.renterName?.toLowerCase())
+            .filter(Boolean)
+        )
+      ).join(' ');
+
       const hay = [
         v.licenseNo,
         v.vin,
         v.make,
         v.model,
         v.className,
-        v.renterName,
+        renterNamesFiltered,
         eventText,
       ]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
+
       return hay.includes(s);
     });
-  }, [enrichedVehicles, search]);
+  }, [enrichedVehicles, search, showClosedReservations]);
 
-  // --- Counts per location, based on searchFiltered (so numbers reflect current search) ---
+  // --- Apply location filter on top of searchFiltered ---
+  const base = useMemo(() => {
+    if (selectedLocationId === 'all') return searchFiltered;
+    return searchFiltered.filter(
+      (v) => v.assignedLocation === selectedLocationId
+    );
+  }, [searchFiltered, selectedLocationId]);
+
+  // Split into On-site (no currentTrip) vs Off-lot (has currentTrip)
+  const onSiteVehicles = useMemo(
+    () => base.filter((v) => !v.currentTrip),
+    [base]
+  );
+
+  // Sort off-lot vehicles by currentTrip.lateAfter (ascending; nulls last)
+  const offLotVehicles = useMemo(() => {
+    const list = base.filter((v) => !!v.currentTrip);
+    return [...list].sort((a, b) => {
+      const A = a.currentTrip?.lateAfter ?? Infinity;
+      const B = b.currentTrip?.lateAfter ?? Infinity;
+      return A - B;
+    });
+  }, [base]);
+
+  // Counts per location button still reflect searchFiltered baseline
   const countsByLocation = useMemo(() => {
     const map = { all: searchFiltered.length };
     for (const loc of locations) {
@@ -184,14 +341,6 @@ export default function VehicleStatus() {
     }
     return map;
   }, [searchFiltered]);
-
-  // --- Apply location filter on top of searchFiltered ---
-  const base = useMemo(() => {
-    if (selectedLocationId === 'all') return searchFiltered;
-    return searchFiltered.filter(
-      (v) => v.assignedLocation === selectedLocationId
-    );
-  }, [searchFiltered, selectedLocationId]);
 
   const statusById = useMemo(() => {
     const map = {};
@@ -210,7 +359,6 @@ export default function VehicleStatus() {
     setOpenVehicleModal(true);
   };
 
-  // Helpers: active styling for filter buttons
   const isActiveFilter = (id) =>
     (id === 'all' && selectedLocationId === 'all') ||
     (id !== 'all' && selectedLocationId === id);
@@ -276,20 +424,55 @@ export default function VehicleStatus() {
         </div>
 
         {/* Results */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 px-4 pb-12">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 px-4 pb-12">
+          {/* On site */}
           <div className="space-y-2">
-            <div className="font-semibold text-white">On site</div>
-            {base.map((vehicle) => (
+            <div className="flex justify-between items-center">
+              <div className="font-semibold text-white">
+                On site ({onSiteVehicles.length})
+              </div>
+              <div className="space-x-2">
+                <Button
+                  onClick={() => setShowClosedReservations((prev) => !prev)}
+                  variant={
+                    showClosedReservations ? 'defaultDark' : 'outlineDark'
+                  }
+                  size="sm"
+                >
+                  {showClosedReservations ? 'Hide closed' : 'Show closed'}
+                </Button>
+              </div>
+            </div>
+
+            {onSiteVehicles.map((vehicle) => (
               <VehicleCard
                 key={vehicle.id}
                 vehicle={vehicle}
                 handleSelectVehicle={handleSelectVehicle}
                 statusById={statusById}
+                showClosedReservations={showClosedReservations}
               />
             ))}
           </div>
+
+          {/* Off lot */}
           <div className="space-y-2">
-            <div className="font-semibold text-white">Off lot</div>
+            <div className="flex justify-between items-center">
+              <div className="font-semibold text-white">
+                Off lot ({offLotVehicles.length})
+              </div>
+              <div className="space-x-2">{/* future filter chips */}</div>
+            </div>
+
+            {offLotVehicles.map((vehicle) => (
+              <VehicleCard
+                key={vehicle.id}
+                vehicle={vehicle}
+                handleSelectVehicle={handleSelectVehicle}
+                statusById={statusById}
+                showClosedReservations={showClosedReservations}
+              />
+            ))}
           </div>
         </div>
       </div>
@@ -298,12 +481,28 @@ export default function VehicleStatus() {
         open={openVehicleModal}
         onClose={() => setOpenVehicleModal(false)}
         vehicle={selectedVehicle}
+        showClosedReservations={showClosedReservations}
+        currentUser={currentUser}
       />
     </DashboardLayout>
   );
 }
 
-function VehicleCard({ vehicle, handleSelectVehicle, statusById, ...rest }) {
+function VehicleCard({
+  vehicle,
+  handleSelectVehicle,
+  statusById,
+  showClosedReservations,
+  ...rest
+}) {
+  // Filter closed events here (keep OOS visible)
+  const eventsToShow = useMemo(() => {
+    const all = Array.isArray(vehicle?.events) ? vehicle.events : [];
+    return filterEventsByClosed(all, showClosedReservations);
+  }, [vehicle, showClosedReservations]);
+
+  const hasTrip = !!vehicle?.currentTrip;
+
   return (
     <div
       onClick={() => handleSelectVehicle(vehicle)}
@@ -323,32 +522,38 @@ function VehicleCard({ vehicle, handleSelectVehicle, statusById, ...rest }) {
           className="w-full h-full object-cover"
         />
       </div>
+
       <div className="col-span-2 w-full">
         <div className="px-3 pt-3">
           <div className="flex justify-between leading-tight w-full">
             <div className="font-medium">
               {vehicle.make} {vehicle.model}{' '}
+              {hasTrip ? (
+                <TripPill trip={vehicle.currentTrip} />
+              ) : eventsToShow.length === 0 ? (
+                <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-green-200 text-green-700">
+                  Available
+                </span>
+              ) : null}
             </div>
             <div className="font-semibold whitespace-nowrap text-end">
               {vehicle.licenseNo}
             </div>
           </div>
         </div>
-
-        {vehicle.events.length === 0 ? (
-          <div className="min-h-22 mt-1 px-3">
-            <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-green-200 text-green-700">
-              Available
-            </span>
-          </div>
+        {vehicle.currentTrip && vehicle.currentTrip.lateAfter && (
+          <>{vehicle.currentTrip.lateAfter}</>
+        )}
+        {eventsToShow.length === 0 ? (
+          <div className="min-h-24 mt-1 px-3"></div>
         ) : (
           <div className="w-full overflow-hidden overflow-x-auto min-h-22 p-3">
             <div
-              className={`grid  ${
-                vehicle.events.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
+              className={`grid ${
+                eventsToShow.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
               } w-max gap-2`}
             >
-              {vehicle.events.map((evt) => (
+              {eventsToShow.map((evt) => (
                 <EventCard key={evt.id} evt={evt} statusById={statusById} />
               ))}
             </div>
@@ -362,7 +567,7 @@ function VehicleCard({ vehicle, handleSelectVehicle, statusById, ...rest }) {
 function EventCard({ evt, statusById, ...rest }) {
   if (evt?.status === 'oos') {
     return (
-      <div className=" bg-white border border-gray-200 rounded-lg py-1 px-2 min-w-[260px] min-h-20">
+      <div className="bg-white border border-gray-200 rounded-lg py-1 px-2 min-w-[260px] min-h-20">
         <div className="text-sm font-semibold">Out of service</div>
         <div className="text-xs">{evt?.description}</div>
       </div>
@@ -371,7 +576,7 @@ function EventCard({ evt, statusById, ...rest }) {
 
   return (
     <div
-      className=" border border-gray-200 rounded-lg py-1 px-2 bg-white min-w-[260px] min-h-20"
+      className="border border-gray-200 rounded-lg py-1 px-2 bg-white min-w-[260px] min-h-20"
       {...rest}
     >
       <div className="flex justify-between mb-1">
@@ -398,7 +603,52 @@ function EventCard({ evt, statusById, ...rest }) {
   );
 }
 
-function VehicleModal({ open, onClose, vehicle }) {
+function VehicleModal({
+  open,
+  onClose,
+  vehicle,
+  showClosedReservations,
+  currentUser,
+}) {
+  // Keep modal in sync with the same closed filter toggle
+  const eventsToShow = useMemo(() => {
+    const all = Array.isArray(vehicle?.events) ? vehicle.events : [];
+    return filterEventsByClosed(all, showClosedReservations);
+  }, [vehicle, showClosedReservations]);
+
+  const handleCheckout = async (event) => {
+    if (!vehicle?.id) return;
+
+    const isOOS = String(event?.status || '').toLowerCase() === 'oos';
+
+    // Build lateAfter from the event's endDate + endTime (reservations only)
+    const lateAfter = isOOS
+      ? null
+      : toTimestamp(event?.endDate, event?.endTime);
+
+    const trip = {
+      timestamp: now,
+      handledBy: currentUser?.email || currentUser?.uid || 'unauthenticated',
+      status: isOOS ? 'out of service' : 'rented',
+      lateAfter: lateAfter ?? null, // <—— stored for off-lot sorting + "Late" pill
+      // For reservations:
+      ...(isOOS
+        ? { oosDescription: event?.description || '' }
+        : {
+            driver: event?.renterName || '',
+            event: event?.id || '',
+          }),
+    };
+
+    try {
+      await updateDoc(doc(db, 'vehicles', vehicle.id), { currentTrip: trip });
+      onClose?.();
+    } catch (err) {
+      console.error('Failed to set currentTrip:', err);
+      // optional: toast error
+    }
+  };
+
   return (
     <Modal
       open={open}
@@ -417,13 +667,27 @@ function VehicleModal({ open, onClose, vehicle }) {
         </>
       }
     >
-      {vehicle?.events?.map((event) => (
-        <div key={event.id}>
-          <ReservationCardCompact reservationId={event.id} />
-
-          <Button variant="primary">Checkout {event.renterName}</Button>
-        </div>
-      ))}
+      {eventsToShow.map((event) => {
+        const isOOS = String(event?.status || '').toLowerCase() === 'oos';
+        return (
+          <div key={event.id} className="space-y-2 mb-4">
+            <div className="font-semibold">
+              {isOOS ? 'Out of service' : event.renterName}
+            </div>
+            {isOOS && (
+              <div className="text-xs text-gray-600">
+                {event?.description || ''}
+              </div>
+            )}
+            <Button variant="primary" onClick={() => handleCheckout(event)}>
+              Checkout{!isOOS && event.renterName ? ` ${event.renterName}` : ''}
+            </Button>
+          </div>
+        );
+      })}
+      {eventsToShow.length === 0 && (
+        <div className="text-sm text-gray-600">No active events.</div>
+      )}
     </Modal>
   );
 }

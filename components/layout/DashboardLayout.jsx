@@ -6,7 +6,7 @@ export default function DashboardLayout({ children }) {
   const [open, setOpen] = useState(false);
 
   return (
-    <div className="h-dvh overflow-hidden flex flex-col bg-gray-50">
+    <div className="h-dvh overflow-hidden flex flex-col  bg-black">
       {/* SideNav overlays the page when open */}
       <SideNav open={open} onClose={() => setOpen(false)} />
 
