@@ -2,32 +2,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import DashboardLayout from '@/components/layout/DashboardLayout';
 import { db } from '@/lib/firebase';
-import {
-  collection,
-  onSnapshot,
-  query,
-  where,
-  doc,
-  updateDoc,
-} from 'firebase/firestore';
+import { collection, onSnapshot, query, where } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 import { FiSearch, FiX } from 'react-icons/fi';
-import Modal from '@/components/ui/Modal';
 import Button from '@/components/ui/Button';
+import VehicleCard from '@/features/vehicle-status/VehicleCard';
+import VehicleModal from '@/features/vehicle-status/VehicleModal';
 
 const AVAILABLE = 'DXuCBw5ovRqNwkda3e5i';
 const PARKED = 'wHdkyrnMeyEYfgUJgRek';
 const OFF_LOT = '58WZhssfhAVfxsvTiOFs';
 
 const now = Date.now();
-
-/** Firestore Timestamp/seconds/number -> ms */
-function tsToMillis(v) {
-  if (typeof v === 'number') return v;
-  if (v && typeof v.toMillis === 'function') return v.toMillis();
-  if (v && typeof v.seconds === 'number') return v.seconds * 1000;
-  return NaN;
-}
 
 /** Parse time in "HH:mm" or "h:mmam"/"h:mmpm" (case-insensitive) → "HH:mm" 24h */
 function parseTimeTo24h(timeStr) {
@@ -87,11 +73,6 @@ const locations = [
   { id: 'dDuHdE9wXNVDtoKcNxhQ', label: 'Waikiki' },
 ];
 
-const locationMap = {
-  '5czwtumKOwNiRLtfVNDw': 'Airport',
-  dDuHdE9wXNVDtoKcNxhQ: 'Waikiki',
-};
-
 function getTodayDate() {
   const today = new Date();
   const yyyy = today.getFullYear();
@@ -107,40 +88,6 @@ function filterEventsByClosed(allEvents = [], showClosed) {
     (e) =>
       String(e?.status || '').toLowerCase() === 'oos' ||
       e?.status !== CLOSED_STATUS_ID
-  );
-}
-
-// Small pill for currentTrip status in Vehicle header
-function TripPill({ trip }) {
-  if (!trip?.status) return null;
-
-  const nowMs = now;
-  const isOOS = trip.status === 'out of service';
-  const lateAfterMs = tsToMillis(trip.lateAfter);
-  const isReservation = !isOOS;
-  const isLate =
-    isReservation && Number.isFinite(lateAfterMs) && nowMs >= lateAfterMs;
-
-  let bg = '#dbeafe',
-    fg = '#1e40af',
-    label = 'Rented'; // default
-  if (isOOS) {
-    bg = '#ef4444';
-    fg = '#ffffff';
-    label = 'Out of service';
-  } else if (isLate) {
-    bg = '#ef4444';
-    fg = '#ffffff';
-    label = 'Late';
-  }
-
-  return (
-    <span
-      className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ml-2"
-      style={{ background: bg, color: fg }}
-    >
-      {label}
-    </span>
   );
 }
 
@@ -485,238 +432,5 @@ export default function VehicleStatus() {
         currentUser={currentUser}
       />
     </DashboardLayout>
-  );
-}
-
-function VehicleCard({
-  vehicle,
-  handleSelectVehicle,
-  statusById,
-  showClosedReservations,
-  ...rest
-}) {
-  // Filter closed events here (keep OOS visible)
-  const eventsToShow = useMemo(() => {
-    const all = Array.isArray(vehicle?.events) ? vehicle.events : [];
-    return filterEventsByClosed(all, showClosedReservations);
-  }, [vehicle, showClosedReservations]);
-
-  const hasTrip = !!vehicle?.currentTrip;
-
-  return (
-    <div
-      onClick={() => handleSelectVehicle(vehicle)}
-      className="rounded-2xl shadow overflow-hidden bg-gray-50 w-full grid grid-cols-3 "
-      {...rest}
-    >
-      <div className=" relative">
-        <div className="absolute top-0 left-0 p-1">
-          <span className="ml-1 inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-black text-white ">
-            {locationMap[vehicle.assignedLocation] ?? '—'}
-          </span>
-        </div>
-        <img
-          //src="/car-placeholder.png"
-          src="https://i.abcnewsfe.com/a/f43853f3-9eaf-4048-9ae7-757332c5787e/mclaren-1-ht-gmh-240412_1712928561648_hpMain_16x9.jpg?w=992"
-          alt="placeholder"
-          className="w-full h-full object-cover"
-        />
-      </div>
-
-      <div className="col-span-2 w-full">
-        <div className="px-3 pt-3">
-          <div className="flex justify-between leading-tight w-full">
-            <div className="font-medium">
-              {vehicle.make} {vehicle.model}{' '}
-              {hasTrip ? (
-                <TripPill trip={vehicle.currentTrip} />
-              ) : eventsToShow.length === 0 ? (
-                <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold bg-green-200 text-green-700">
-                  Available
-                </span>
-              ) : null}
-            </div>
-            <div className="font-semibold whitespace-nowrap text-end">
-              {vehicle.licenseNo}
-            </div>
-          </div>
-        </div>
-        {vehicle.currentTrip && vehicle.currentTrip.lateAfter && (
-          <>{vehicle.currentTrip.lateAfter}</>
-        )}
-        {eventsToShow.length === 0 ? (
-          <div className="min-h-24 mt-1 px-3"></div>
-        ) : (
-          <div className="w-full overflow-hidden overflow-x-auto min-h-22 p-3">
-            <div
-              className={`grid ${
-                eventsToShow.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
-              } w-max gap-2`}
-            >
-              {eventsToShow.map((evt) => (
-                <EventCard key={evt.id} evt={evt} statusById={statusById} />
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function EventCard({ evt, statusById, ...rest }) {
-  if (evt?.status === 'oos') {
-    return (
-      <div className="bg-white border border-gray-200 rounded-lg py-1 px-2 min-w-[260px] min-h-20">
-        <div className="text-sm font-semibold">Out of service</div>
-        <div className="text-xs">{evt?.description}</div>
-      </div>
-    );
-  }
-
-  return (
-    <div
-      className="border border-gray-200 rounded-lg py-1 px-2 bg-white min-w-[260px] min-h-20"
-      {...rest}
-    >
-      <div className="flex justify-between mb-1">
-        <span className="text-sm mr-2 font-semibold">{evt.renterName}</span>
-        <EventPill event={evt} statusById={statusById} />
-      </div>
-      <div className="grid grid-cols-2 gap-2 text-sm">
-        <div className="">
-          <div className="text-xs uppercase font-semibold">Pick-up</div>
-          <div className="text-xs">{locationMap[evt?.pickUpLocation]}</div>
-          <div className="text-xs">
-            {evt?.startDate} {evt?.startTime}
-          </div>
-        </div>
-        <div className="">
-          <div className="text-xs uppercase font-semibold">Return</div>
-          <div className="text-xs">{locationMap[evt?.returnLocation]}</div>
-          <div className="text-xs">
-            {evt?.endDate} {evt?.endTime}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function VehicleModal({
-  open,
-  onClose,
-  vehicle,
-  showClosedReservations,
-  currentUser,
-}) {
-  // Keep modal in sync with the same closed filter toggle
-  const eventsToShow = useMemo(() => {
-    const all = Array.isArray(vehicle?.events) ? vehicle.events : [];
-    return filterEventsByClosed(all, showClosedReservations);
-  }, [vehicle, showClosedReservations]);
-
-  const handleCheckout = async (event) => {
-    if (!vehicle?.id) return;
-
-    const isOOS = String(event?.status || '').toLowerCase() === 'oos';
-
-    // Build lateAfter from the event's endDate + endTime (reservations only)
-    const lateAfter = isOOS
-      ? null
-      : toTimestamp(event?.endDate, event?.endTime);
-
-    const trip = {
-      timestamp: now,
-      handledBy: currentUser?.email || currentUser?.uid || 'unauthenticated',
-      status: isOOS ? 'out of service' : 'rented',
-      lateAfter: lateAfter ?? null, // <—— stored for off-lot sorting + "Late" pill
-      // For reservations:
-      ...(isOOS
-        ? { oosDescription: event?.description || '' }
-        : {
-            driver: event?.renterName || '',
-            event: event?.id || '',
-          }),
-    };
-
-    try {
-      await updateDoc(doc(db, 'vehicles', vehicle.id), { currentTrip: trip });
-      onClose?.();
-    } catch (err) {
-      console.error('Failed to set currentTrip:', err);
-      // optional: toast error
-    }
-  };
-
-  return (
-    <Modal
-      open={open}
-      onClose={onClose}
-      title={
-        vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.licenseNo}` : ''
-      }
-      footer={
-        <>
-          <Button variant="outline" onClick={onClose}>
-            Add photo
-          </Button>
-          <Button variant="outline" onClick={onClose}>
-            Close
-          </Button>
-        </>
-      }
-    >
-      {eventsToShow.map((event) => {
-        const isOOS = String(event?.status || '').toLowerCase() === 'oos';
-        return (
-          <div key={event.id} className="space-y-2 mb-4">
-            <div className="font-semibold">
-              {isOOS ? 'Out of service' : event.renterName}
-            </div>
-            {isOOS && (
-              <div className="text-xs text-gray-600">
-                {event?.description || ''}
-              </div>
-            )}
-            <Button variant="primary" onClick={() => handleCheckout(event)}>
-              Checkout{!isOOS && event.renterName ? ` ${event.renterName}` : ''}
-            </Button>
-          </div>
-        );
-      })}
-      {eventsToShow.length === 0 && (
-        <div className="text-sm text-gray-600">No active events.</div>
-      )}
-    </Modal>
-  );
-}
-
-function EventPill({ event, statusById }) {
-  if (!event) return null;
-  const isOOS = String(event.status || '').toLowerCase() === 'oos';
-  if (isOOS) {
-    return (
-      <span
-        className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold"
-        style={{ background: '#ef4444', color: '#ffffff' }}
-        title="Out of service"
-      >
-        Out of service
-      </span>
-    );
-  }
-  const rs = statusById[event.status];
-  const bg = rs?.background || '#e5e7eb';
-  const fg = rs?.text || '#111827';
-  const label = rs?.name || 'Status';
-  return (
-    <span
-      className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold"
-      style={{ background: bg, color: fg }}
-      title={label}
-    >
-      {label}
-    </span>
   );
 }
